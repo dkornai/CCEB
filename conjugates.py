@@ -1,3 +1,4 @@
+from matplotlib import scale
 import torch
 import torch.distributions as D
 import pyro.distributions as pyroD
@@ -36,7 +37,9 @@ class SuffStatsGaussian:
     @property
     def scatter(self):
         """
-        Scatter matrix S = sum (x - mean)(x - mean)^T
+        S = Σ_i (x_i - x̄)(x_i - x̄)^T = Σ_i (x_i)(x_i)^T - n * (x̄)(x̄)^T
+
+            Scatter around the empirical mean.
         """
         if self.n == 0:
             return None
@@ -47,8 +50,7 @@ class SuffStatsGaussian:
 class ConjugateGaussian:
     def __init__(self, mu0, kappa0, nu0, Lambda0):
         """
-        Conjugate prior for multivariate Gaussian with unknown mean & covariance.
-
+        Conjugate Gaussian-Inverse Wishart prior for multivariate Gaussian with unknown mean & covariance.
 
         mu0:        prior mean mean [d]
         kappa0:     pseudocount of prior measurements
@@ -70,7 +72,9 @@ class ConjugateGaussian:
         assert type(Lambda0) == torch.Tensor, "scale matrix Lambda0 must be a torch tensor"
         assert Lambda0.dim() == 2, "scale matrix Lambda0 must be a 2D tensor"
         assert Lambda0.shape[0] == Lambda0.shape[1] == mu0.shape[0], "scale matrix Lambda0 must be of shape (d,d)"
-        #assert torch.all(torch.linalg.eigvals(Lambda0) > 0), "scale matrix Lambda0 must be positive definite"
+        # check positive definiteness
+        eigvals = torch.linalg.eigvalsh(Lambda0)
+        assert torch.all(eigvals > 0), "scale matrix Lambda0 must be positive definite"
         self.Lambda0 = Lambda0
 
         self.d = mu0.shape[0]
@@ -99,24 +103,33 @@ class ConjugateGaussian:
         Update posterior parameters based on current sufficient statistics.
         """
         n = self.suffstats.n
-        if n == 0:
-            self.reset_posterior()
-            return
-
-        # Get mean and scatter sufficient statistics
         x_bar = self.suffstats.mean
-        S = self.suffstats.scatter
+        
 
         # Update posterior of mean
+        """
+        μ_n = ( (κ_0 / (κ_0 + n)) * μ0 ) + ( (n / (κ0 + n)) * x̄ )
+        """
         self.mu_n = ((self.kappa0 / (self.kappa0 + n)) * self.mu0 ) + ((n / (self.kappa0 + n)) * x_bar)
 
         # Update posterior of kappa
+        """
+        κ_n = κ_0 + n
+        """
         self.kappa_n = self.kappa0 + n
 
         # Update posterior of nu
+        """
+        ν_n = ν_0 + n
+        """
         self.nu_n = self.nu0 + n
 
         # Update posterior of Lambda
+        """
+        Λ_n = Λ_0 + S + ((κ_0 * n )/ (κ_n)) * (x̄ - μ0)(x̄ - μ0)^T
+
+        """
+        S = self.suffstats.scatter
         diff = (x_bar - self.mu0).unsqueeze(1)  # column vector, difference between sample mean and prior mean
         self.Lambda_n = self.Lambda0 + S + ((self.kappa0 * n )/ (self.kappa_n)) * (diff @ diff.T)
 
@@ -132,23 +145,33 @@ class ConjugateGaussian:
         """
         Sample from the posterior distribution over the mean vector and covariance matrix.
         """
-        # Sample covariance matrix from Wishart, with precision (inverse covariance) being the covariance of the inverse-Wishart
-        Sigma = D.Wishart(df=self.nu_n, precision_matrix=self.Lambda_n).sample()
+        # Sample covariance matrix
+        """
+        To get: Σ ~ IW(ν_n, Λ_n)    
+        Ω ~ W(ν_n, Λ_n^{-1})        we can sample a precision matrix from the Wishart distribution,
+        Σ = Ω^{-1}                  then invert
+        """
+        Prec = D.Wishart(df=self.nu_n, covariance_matrix=torch.linalg.inv(self.Lambda_n)).sample()
+        Sigma = torch.linalg.inv(Prec)
         # Sample mean from Gaussian
+        """
+        μ ~ 𝒩(μ_n, Σ / κ_n)
+        """
         mu = D.MultivariateNormal(loc=self.mu_n, covariance_matrix=(Sigma / self.kappa_n)).sample()
-        return mu, Sigma
         
+        return mu, Sigma
+    
     def _predictive_distribution_params(self):
         """
         Returns parameters of the multivariate Student-t predictive distribution (uncerteanty over mean and variance is integrated out).
         """
         df = self.nu_n - self.d + 1
         scale = (self.Lambda_n * (self.kappa_n + 1)) / (self.kappa_n * df)
+        
         return {
             "df": df,
             "loc": self.mu_n,
             "scale": scale,
-            "scale_tril": torch.linalg.cholesky(scale),
         }
     
     def predictive_likelihood(self, x: torch.Tensor):
@@ -156,7 +179,8 @@ class ConjugateGaussian:
         Returns the predictive likelihood of a new observation x.
         """
         params = self._predictive_distribution_params()
-        pred_dist = pyroD.MultivariateStudentT(df=params["df"], loc=params["loc"], scale_tril=params["scale_tril"])
+        scale_tril = torch.linalg.cholesky(params["scale"])
+        pred_dist = pyroD.MultivariateStudentT(df=params["df"], loc=params["loc"], scale_tril=scale_tril)
         return torch.exp(pred_dist.log_prob(x))
     
 

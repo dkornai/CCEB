@@ -11,11 +11,13 @@ class Particle():
     """
     Main class implementing a single particle in the CCEB model
     """
-    def __init__(self, hyp_gamma, hyp_alpha_o=1.0, hyp_alpha_r=1.0):
+    def __init__(self, hyp_gamma, hyp_alpha_o=1.0, hyp_alpha_r=1.0, hyp_niw=None, hyp_dm=None):
         
         self.hyp_gamma = hyp_gamma
         self.hyp_alpha_o = hyp_alpha_o
         self.hyp_alpha_r = hyp_alpha_r
+        self.hyp_niw = hyp_niw
+        self.hyp_dm = hyp_dm
 
         self.state_space = [0, 1]
         self.state_probs = torch.tensor([0.5, 0.5])
@@ -33,8 +35,8 @@ class Particle():
         self.prev_o_context = 0
         self.prev_r_context = 0
 
-        self.novel_obs_model = ConjugateGaussian(**conjugate_gaussian_standard)
-        self.novel_reward_model = ConjugateCategorical(alpha0=alpha_0_standard)
+        self.novel_obs_model = ConjugateGaussian(**self.hyp_niw)
+        self.novel_reward_model = ConjugateCategorical(alpha0=self.hyp_dm)
 
     @property
     def n_contexts_o(self):
@@ -56,13 +58,13 @@ class Particle():
         if c_o_t == self.n_contexts_o: 
             self.context_o_space.append(self.n_contexts_o)
             for i, state in enumerate(self.state_space):
-                self.observation_models[i].append(ConjugateGaussian(**conjugate_gaussian_standard))
+                self.observation_models[i].append(ConjugateGaussian(**self.hyp_niw))
         
         # Handle new reward context if needed
         if c_r_t == len(self.context_r_space): 
             self.context_r_space.append(len(self.context_r_space))
             for i, state in enumerate(self.state_space):
-                self.reward_models[i].append(ConjugateCategorical(alpha0=alpha_0_standard))
+                self.reward_models[i].append(ConjugateCategorical(alpha0=self.hyp_dm))
 
 
 
@@ -360,11 +362,3 @@ def print_particle_params(particle: Particle):
 
 
 
-# Standard prior parameters for conjugate models
-conjugate_gaussian_standard = {
-    'mu0': torch.tensor([0.0, 0.0, 0.0]),
-    'kappa0': 0.1,
-    'nu0': 4.0,
-    'Lambda0': torch.eye(3) * 1.0 
-}
-alpha_0_standard = torch.tensor([0.1, 0.1, 0.1, 0.1])

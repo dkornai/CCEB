@@ -9,6 +9,9 @@ class CRP():
 
     @property
     def probabilities(self):
+        """
+        Prior probabilities for each category, including a new one
+        """
         # returns the probability of each context (including a new one)
         prob = torch.zeros(self.n+1)
         prob[:-1] = self.counts
@@ -18,6 +21,9 @@ class CRP():
         return prob
     
     def update_vec(self, c:torch.Tensor):
+        """
+        Update the counts with a vector of context responsibilities (either the same length as n, or n+1)
+        """
         # if the length of the context responsibilities vector is == n, add c to counts
         if c.shape[0] == self.n:
             self.counts += c
@@ -30,6 +36,9 @@ class CRP():
             self.counts = new_counts
 
     def update_single(self, c:int):
+        """
+        Update the counts with a single context assignment
+        """
         if c == self.n:
             self.n += 1
             new_counts = torch.zeros(self.n)
@@ -40,4 +49,7 @@ class CRP():
             self.counts[c] += 1
 
     def sample(self) -> int:
+        """
+        Sample from the CRP prior
+        """
         return D.Categorical(probs=self.probabilities).sample().item()

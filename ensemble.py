@@ -9,9 +9,9 @@ class Ensemble():
     """
     Ensemble of particles for particle filtering
     """
-    def __init__(self, N, hyp_gamma=0.05, hyp_alpha_o=1.0, hyp_alpha_r=1.0):
+    def __init__(self, N, hyp_gamma=0.05, hyp_alpha_o=1.0, hyp_alpha_r=1.0, hyp_niw=None, hyp_dm=None):
         self.N = N
-        self.particles = [Particle(hyp_gamma, hyp_alpha_o, hyp_alpha_r) for _ in range(N)]
+        self.particles = [Particle(hyp_gamma, hyp_alpha_o, hyp_alpha_r, hyp_niw, hyp_dm) for _ in range(N)]
         self.weights = torch.ones(N) / N
 
         self.vec_s_t    = torch.zeros(N, dtype=torch.long)
