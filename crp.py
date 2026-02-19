@@ -8,7 +8,7 @@ class CRP():
         self.counts = torch.zeros(1)
 
     @property
-    def probabilities(self):
+    def probs(self):
         """
         Prior probabilities for each category, including a new one
         """
@@ -52,4 +52,4 @@ class CRP():
         """
         Sample from the CRP prior
         """
-        return D.Categorical(probs=self.probabilities).sample().item()
+        return D.Categorical(probs=self.probs).sample().item()

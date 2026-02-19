@@ -1,9 +1,61 @@
-from matplotlib import scale
 import torch
 import torch.distributions as D
 import pyro.distributions as pyroD
 
-class SuffStatsGaussian:
+class SuffStats:
+    """
+    Class that maintains the sufficient statistics for a distribution.
+    This is a base class that can be extended for specific distributions.
+    """
+    def __init__(self):
+        pass
+
+    def update(self, x, confidence=1.0):
+        """
+        Update sufficient statistics with a new observation x.
+        confidence: weight of the new observation (default 1.0)
+        """
+        raise NotImplementedError("update method must be implemented by subclass")
+    
+class ConjugateModel:
+    """
+    Base class for a conjugate model. This should be extended for specific likelihood-prior pairs.
+    """
+    def __init__(self):
+        pass
+
+    def update(self, x, confidence=1.0):
+        """
+        Add a new observation and update posterior parameters.
+        """
+        raise NotImplementedError("update method must be implemented by subclass")
+
+    def post_params(self):
+        """
+        Return current posterior parameters as a dictionary.
+        """
+        raise NotImplementedError("post_params method must be implemented by subclass")
+
+    def sample_post_dist(self):
+        """
+        Sample from the posterior distribution over parameters.
+        """
+        raise NotImplementedError("sample_post_dist method must be implemented by subclass")
+    
+    def _pred_dist_params(self):
+        """
+        Return parameters of the posterior predictive distribution.
+        """
+        raise NotImplementedError("_pred_dist_params method must be implemented by subclass")
+    
+    def pred_lh(self, x):
+        """
+        Return the predictive likelihood of a new observation x.
+        """
+        raise NotImplementedError("pred_lh method must be implemented by subclass")
+
+
+class SuffStatsGaussian(SuffStats):
     """
     Class that maintains the sufficient statistics for a (multivariate) Gaussian distribution.
     Sufficient statistics are:
@@ -47,7 +99,7 @@ class SuffStatsGaussian:
         return self.sum_xx - self.n * torch.outer(mu, mu)
 
 
-class ConjugateGaussian:
+class ConjugateGaussian(ConjugateModel):
     def __init__(self, mu0, kappa0, nu0, Lambda0):
         """
         Conjugate Gaussian-Inverse Wishart prior for multivariate Gaussian with unknown mean & covariance.
@@ -127,21 +179,20 @@ class ConjugateGaussian:
         # Update posterior of Lambda
         """
         Λ_n = Λ_0 + S + ((κ_0 * n )/ (κ_n)) * (x̄ - μ0)(x̄ - μ0)^T
-
         """
         S = self.suffstats.scatter
         diff = (x_bar - self.mu0).unsqueeze(1)  # column vector, difference between sample mean and prior mean
         self.Lambda_n = self.Lambda0 + S + ((self.kappa0 * n )/ (self.kappa_n)) * (diff @ diff.T)
 
-    def posterior_params(self):
+    def post_params(self):
         return {
-            "mu_n": self.mu_n,
-            "kappa_n": self.kappa_n,
-            "nu_n": self.nu_n,
-            "Lambda_n": self.Lambda_n,
+            "mu_n":         self.mu_n,
+            "kappa_n":      self.kappa_n,
+            "nu_n":         self.nu_n,
+            "Lambda_n":     self.Lambda_n,
         }
     
-    def sample_posterior_distribution(self):
+    def sample_post_dist(self):
         """
         Sample from the posterior distribution over the mean vector and covariance matrix.
         """
@@ -161,7 +212,7 @@ class ConjugateGaussian:
         
         return mu, Sigma
     
-    def _predictive_distribution_params(self):
+    def _pred_dist_params(self):
         """
         Returns parameters of the multivariate Student-t predictive distribution (uncerteanty over mean and variance is integrated out).
         """
@@ -169,23 +220,23 @@ class ConjugateGaussian:
         scale = (self.Lambda_n * (self.kappa_n + 1)) / (self.kappa_n * df)
         
         return {
-            "df": df,
-            "loc": self.mu_n,
-            "scale": scale,
+            "df":           df,
+            "loc":          self.mu_n,
+            "scale":        scale,
         }
     
-    def predictive_likelihood(self, x: torch.Tensor):
+    def pred_lh(self, x: torch.Tensor):
         """
         Returns the predictive likelihood of a new observation x.
         """
-        params = self._predictive_distribution_params()
+        params = self._pred_dist_params()
         scale_tril = torch.linalg.cholesky(params["scale"])
         pred_dist = pyroD.MultivariateStudentT(df=params["df"], loc=params["loc"], scale_tril=scale_tril)
         return torch.exp(pred_dist.log_prob(x))
     
 
 
-class SuffStatsCategorical:
+class SuffStatsCategorical(SuffStats):
     """
     Maintains sufficient statistics for a categorical distribution.
     Sufficient stats: counts of each category.
@@ -209,7 +260,7 @@ class SuffStatsCategorical:
         return self.counts.clone()
 
 
-class ConjugateCategorical:
+class ConjugateCategorical(ConjugateModel):
     """
     Conjugate model: categorical likelihood with Dirichlet prior.
     Supports incremental updates and posterior predictive probabilities.
@@ -239,19 +290,19 @@ class ConjugateCategorical:
     def _update_posterior(self):
         self.alpha_n = self.alpha0 + self.suffstats.as_tensor().to(torch.float)
 
-    def posterior_params(self):
+    def post_params(self):
         return {
             "alpha_n": self.alpha_n
         }
 
-    def sample_posterior_distribution(self):
+    def sample_post_dist(self):
         """
         Sample from the posterior distribution over theta.
         """
         theta = D.Dirichlet(self.alpha_n).sample()
         return theta
 
-    def _predictive_distribution_params(self):
+    def _pred_dist_params(self):
         """
         Posterior predictive probabilities for each category:
         theta_n = (alpha_n / sum(alpha_n))
@@ -259,19 +310,19 @@ class ConjugateCategorical:
         theta_n = self.alpha_n / self.alpha_n.sum()
         return theta_n
 
-    def predictive_likelihood(self, x: int):
+    def pred_lh(self, x: int):
         """
         Predictive likelihood of a new categorical observation.
         """
-        probs = self._predictive_distribution_params()
+        probs = self._pred_dist_params()
         return probs[x].item()
 
 
-class SuffStatsBernoulli:
+class SuffStatsBernoulli(SuffStats):
     """
     Maintains sufficient statistics for a collection of K Bernoulli distributions.
 
-    For each action a:
+    Sufficient stats for each action a:
         succ[a] : (soft) count of r=1 outcomes
         fail[a] : (soft) count of r=0 outcomes
 
@@ -305,7 +356,7 @@ class SuffStatsBernoulli:
         return float((self.succ + self.fail).sum().item())
 
 
-class ConjugateBernoulli:
+class ConjugateBernoulli(ConjugateModel):
     """
     Conjugate model for:
         r | a ~ Bernoulli(p_a)
@@ -334,8 +385,8 @@ class ConjugateBernoulli:
         """
         Posterior parameters start at prior.
         """
-        self.alpha_n = self.alpha0.clone()
-        self.beta_n  = self.beta0.clone()
+        self.alpha_n  = self.alpha0.clone()
+        self.beta_n   = self.beta0.clone()
 
     def update(self, a: int, r: float, confidence: float = 1.0):
         """
@@ -354,8 +405,11 @@ class ConjugateBernoulli:
         self.alpha_n = self.alpha0 + succ.to(torch.float)
         self.beta_n  = self.beta0  + fail.to(torch.float)
 
-    def posterior_params(self):
-        return {"alpha_n": self.alpha_n, "beta_n": self.beta_n}
+    def post_params(self):
+        return {
+            "alpha_n":      self.alpha_n, 
+            "beta_n":       self.beta_n
+        }
 
     def predictive_p(self):
         """
@@ -363,13 +417,13 @@ class ConjugateBernoulli:
         """
         return self.alpha_n / (self.alpha_n + self.beta_n)
     
-    def _predictive_distribution_params(self):
+    def _pred_dist_params(self):
         """
         Returns parameters of the Bernoulli predictive distribution for each action.
         """
         return self.predictive_p()
 
-    def predictive_likelihood(self, a: int, r: float):
+    def pred_lh(self, a: int, r: float):
         """
         Predictive likelihood of observing reward r given action a.
             P(r=1 | a) = alpha_n[a] / (alpha_n[a] + beta_n[a])
@@ -383,7 +437,7 @@ class ConjugateBernoulli:
         else:
             raise ValueError(f"reward r must be 0.0 or 1.0, got {r}")
 
-    def sample_posterior_distribution(self):
+    def sample_post_dist(self):
         """
         Returns a tensor of shape [K] with one sampled p_a per action.
         """

@@ -1,6 +1,27 @@
 import torch
 import torch.distributions as D
 
+def normalise(probs: torch.Tensor, eps: float = 1e-30):
+    """
+    Normalise a tensor of probabilities to sum to 1, with numerical stability.
+    
+    probs: tensor of probabilities (not necessarily normalized)
+    eps: small constant to prevent division by zero
+    returns: normalized probabilities
+    """
+    total = torch.sum(probs) + eps
+    return probs / total
+
+
+def bern_sample(prob: float | torch.Tensor):
+    """
+    Sample from a Bernoulli distribution with given probability.
+    
+    prob: probability of success (float or tensor)
+    returns: sampled binary value (0 or 1)
+    """
+    return int(D.Bernoulli(probs=prob).sample().item())
+
 
 def cat_sample(probs: torch.Tensor):
     """
@@ -41,6 +62,7 @@ def cat2D_sample(probs: torch.Tensor):
     """
     cat2d = Categorical2D(probs)
     return cat2d.sample()
+
 
 class Categorical3D():
     """
