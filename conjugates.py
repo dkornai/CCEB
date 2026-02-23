@@ -16,11 +16,22 @@ class SuffStats:
         confidence: weight of the new observation (default 1.0)
         """
         raise NotImplementedError("update method must be implemented by subclass")
+
+    def to_state(self) -> dict:
+        raise NotImplementedError
+
+    @classmethod
+    def from_state(cls, state: dict):
+        raise NotImplementedError
+
     
 class ConjugateModel:
     """
     Base class for a conjugate model. This should be extended for specific likelihood-prior pairs.
     """
+    # subclasses MUST set this to specific sufficient statistics class, e.g. SuffStatsGaussian
+    SUFFSTATS_CLS = None  # type: type[SuffStats]
+    
     def __init__(self):
         pass
 
@@ -30,7 +41,7 @@ class ConjugateModel:
         """
         raise NotImplementedError("update method must be implemented by subclass")
 
-    def post_params(self):
+    def post_params(self) -> dict:
         """
         Return current posterior parameters as a dictionary.
         """
@@ -53,6 +64,34 @@ class ConjugateModel:
         Return the predictive likelihood of a new observation x.
         """
         raise NotImplementedError("pred_lh method must be implemented by subclass")
+    
+    def to_state(self) -> dict:
+        """
+        For all conjugate models, the minimal state representation needed to reconstruct the object is \\
+        just the sufficient statistics, since the posterior can be fully reconstructed from the sufficient \\
+        statistics and the prior parameters (which are fixed and known).
+        """
+        return {"suffstats": self.suffstats.to_state()}
+
+    @classmethod
+    def from_state(cls, hyp_params: dict, state: dict):
+        """
+        Reconstruct a conjugate model object from its minimal state representation, \\
+        which is just the sufficient statistics and the prior parameters.
+        """
+        # check that subclass has set SUFFSTATS_CLS
+        if cls.SUFFSTATS_CLS is None:
+            raise TypeError(f"{cls.__name__} must set SUFFSTATS_CLS")
+
+        # Re-init the object with the prior parameters
+        obj = cls(**hyp_params)
+        # Then reconstruct the sufficient statistics from the state
+        obj.suffstats = cls.SUFFSTATS_CLS.from_state(state["suffstats"])
+        # Finally, update the posterior parameters based on the sufficient statistics
+        obj._update_posterior()
+
+        return obj
+
 
 
 class SuffStatsGaussian(SuffStats):
@@ -98,8 +137,33 @@ class SuffStatsGaussian(SuffStats):
         mu = self.mean
         return self.sum_xx - self.n * torch.outer(mu, mu)
 
+    def to_state(self):
+        """
+        Minimal state representation needed to reconstruct the sufficient statistics.
+        """
+        return {
+            "n":        float(self.n),
+            "sum_x":    self.sum_x,
+            "sum_xx":   self.sum_xx,
+        }
+
+    @classmethod
+    def from_state(cls, state):
+        """
+        Reconstruct sufficient statistics from its minimal state representation.
+        """
+        d = int(state["sum_x"].numel())
+        obj = cls(d)
+        obj.n = float(state["n"])
+        obj.sum_x = state["sum_x"].clone()
+        obj.sum_xx = state["sum_xx"].clone()
+        return obj
+
+
 
 class ConjugateGaussian(ConjugateModel):
+    SUFFSTATS_CLS = SuffStatsGaussian
+
     def __init__(self, mu0, kappa0, nu0, Lambda0):
         """
         Conjugate Gaussian-Inverse Wishart prior for multivariate Gaussian with unknown mean & covariance.
@@ -154,9 +218,11 @@ class ConjugateGaussian(ConjugateModel):
         """
         Update posterior parameters based on current sufficient statistics.
         """
-        n = self.suffstats.n
-        x_bar = self.suffstats.mean
+        if self.suffstats.n == 0: # do not update posterior if there are no datapoints
+            return
         
+        x_bar = self.suffstats.mean
+        n = self.suffstats.n
 
         # Update posterior of mean
         """
@@ -230,10 +296,161 @@ class ConjugateGaussian(ConjugateModel):
         Returns the predictive likelihood of a new observation x.
         """
         params = self._pred_dist_params()
-        scale_tril = torch.linalg.cholesky(params["scale"])
-        pred_dist = pyroD.MultivariateStudentT(df=params["df"], loc=params["loc"], scale_tril=scale_tril)
+        pred_dist = pyroD.MultivariateStudentT(df=params["df"], loc=params["loc"], scale_tril=torch.linalg.cholesky(params["scale"]))
         return torch.exp(pred_dist.log_prob(x))
+
+
+class SuffStatsBernoulli(SuffStats):
+    """
+    Maintains sufficient statistics for a collection of K Bernoulli distributions.
+
+    Sufficient stats for each action a:
+        succ[a] : (soft) count of r=1 outcomes
+        fail[a] : (soft) count of r=0 outcomes
+
+    This supports confidence-weighted (fractional) updates.
+    """
+    def __init__(self, K: int):
+        self.K = K
+        self.succ = torch.zeros(K)
+        self.fail = torch.zeros(K)
+
+    def update(self, a: int, r: float, confidence: float = 1.0):
+        """
+        Update with one observation (a, r), where r in {0.0, 1.0}.
+        """
+        assert 0 <= a < self.K, f"action {a} out of range for {self.K} actions"
+        assert (r == 0.0) or (r == 1.0), f"reward r must be 0.0 or 1.0, got {r}"
+
+        if r == 1.0:
+            self.succ[a] += confidence
+        else:
+            self.fail[a] += confidence
+
+    def as_tensors(self):
+        return self.succ.clone(), self.fail.clone()
+
+    @property
+    def n(self):
+        """
+        Total (soft) number of observations across all actions.
+        """
+        return float((self.succ + self.fail).sum().item())
+
+    def to_state(self):
+        """
+        Minimal state representation needed to reconstruct the sufficient statistics
+        """
+        return {
+            "succ":     self.succ, 
+            "fail":     self.fail
+            }
+
+    @classmethod
+    def from_state(cls, state):
+        """
+        Reconstruct sufficient statistics from its minimal state representation
+        """
+        K = int(state["succ"].numel())
+        obj = cls(K)
+        obj.succ = state["succ"].clone()
+        obj.fail = state["fail"].clone()
+        return obj
+
+
+class ConjugateBernoulli(ConjugateModel):
+    """
+    Conjugate model for:
+        r | a ~ Bernoulli(p_a)
+        p_a ~ Beta(alpha0[a], beta0[a])   
+    independently for each action a in {0, ..., K-1}.
+    """
+    SUFFSTATS_CLS = SuffStatsBernoulli
+
+    def __init__(self, alpha0: torch.Tensor, beta0: torch.Tensor):
+        """
+        alpha0:     [K] prior pseudo-counts of successes (r=1) per action
+        beta0:      [K] prior pseudo-counts of failures  (r=0) per action
+        """
+        assert isinstance(alpha0, torch.Tensor) and isinstance(beta0, torch.Tensor), "alpha0 and beta0 must be torch tensors"
+        assert alpha0.dim() == 1 and beta0.dim() == 1, "alpha0 and beta0 must be 1D tensors"
+        assert alpha0.shape == beta0.shape, "alpha0 and beta0 must have the same shape"
+        assert torch.all(alpha0 > 0), "alpha0 must be > 0"
+        assert torch.all(beta0 > 0), "beta0 must be > 0"
+
+        self.alpha0 = alpha0.clone().to(torch.float)
+        self.beta0  = beta0.clone().to(torch.float)
+        self.K = int(alpha0.shape[0])
+
+        self.suffstats = SuffStatsBernoulli(self.K)
+        self.reset_posterior()
+
+    def reset_posterior(self):
+        """
+        Posterior parameters start at prior.
+        """
+        self.alpha_n  = self.alpha0.clone()
+        self.beta_n   = self.beta0.clone()
+
+    def update(self, a: int, r: float, confidence: float = 1.0):
+        """
+        Update sufficient stats with (a, r) and refresh posterior parameters.
+        """
+        self.suffstats.update(a, r, confidence=confidence)
+        self._update_posterior()
+
+    def _update_posterior(self):
+        """
+        Beta posterior for each action:
+            alpha_n[a] = alpha0[a] + succ[a]
+            beta_n[a]  = beta0[a]  + fail[a]
+        """
+
+        if self.suffstats.n == 0: # do not update posterior if there are no datapoints
+            return
+
+        succ, fail = self.suffstats.as_tensors()
+        self.alpha_n = self.alpha0 + succ.to(torch.float)
+        self.beta_n  = self.beta0  + fail.to(torch.float)
+
+    def post_params(self):
+        return {
+            "alpha_n":      self.alpha_n, 
+            "beta_n":       self.beta_n
+        }
+
+    def predictive_p(self):
+        """
+        Posterior predictive mean of p_a = P(r=1 | a) for each action.
+        """
+        return self.alpha_n / (self.alpha_n + self.beta_n)
     
+    def _pred_dist_params(self):
+        """
+        Returns parameters of the Bernoulli predictive distribution for each action.
+        """
+        return self.predictive_p()
+
+    def pred_lh(self, a: int, r: float):
+        """
+        Predictive likelihood of observing reward r given action a.
+            P(r=1 | a) = alpha_n[a] / (alpha_n[a] + beta_n[a])
+            P(r=0 | a) = 1 - P(r=1 | a)
+        """
+        p = self.predictive_p()[a]
+        if r == 1.0:
+            return p
+        elif r == 0.0:
+            return 1.0 - p
+        else:
+            raise ValueError(f"reward r must be 0.0 or 1.0, got {r}")
+
+    def sample_post_dist(self):
+        """
+        Returns a tensor of shape [K] with one sampled p_a per action.
+        """
+        return D.Beta(self.alpha_n, self.beta_n).sample()
+
 
 
 class SuffStatsCategorical(SuffStats):
@@ -265,6 +482,8 @@ class ConjugateCategorical(ConjugateModel):
     Conjugate model: categorical likelihood with Dirichlet prior.
     Supports incremental updates and posterior predictive probabilities.
     """
+    SUFFSTATS_CLS = SuffStatsCategorical
+
     def __init__(self, alpha0: torch.Tensor):
         assert alpha0.dim() == 1, "alpha0 must be a 1D tensor"
         assert torch.all(alpha0 > 0), "alpha0 parameters must be > 0"
@@ -316,129 +535,3 @@ class ConjugateCategorical(ConjugateModel):
         """
         probs = self._pred_dist_params()
         return probs[x].item()
-
-
-class SuffStatsBernoulli(SuffStats):
-    """
-    Maintains sufficient statistics for a collection of K Bernoulli distributions.
-
-    Sufficient stats for each action a:
-        succ[a] : (soft) count of r=1 outcomes
-        fail[a] : (soft) count of r=0 outcomes
-
-    This supports confidence-weighted (fractional) updates.
-    """
-    def __init__(self, K: int):
-        self.K = K
-        self.succ = torch.zeros(K)
-        self.fail = torch.zeros(K)
-
-    def update(self, a: int, r: float, confidence: float = 1.0):
-        """
-        Update with one observation (a, r), where r in {0.0, 1.0}.
-        """
-        assert 0 <= a < self.K, f"action {a} out of range for {self.K} actions"
-        assert (r == 0.0) or (r == 1.0), f"reward r must be 0.0 or 1.0, got {r}"
-
-        if r == 1.0:
-            self.succ[a] += confidence
-        else:
-            self.fail[a] += confidence
-
-    def as_tensors(self):
-        return self.succ.clone(), self.fail.clone()
-
-    @property
-    def n(self):
-        """
-        Total (soft) number of observations across all actions.
-        """
-        return float((self.succ + self.fail).sum().item())
-
-
-class ConjugateBernoulli(ConjugateModel):
-    """
-    Conjugate model for:
-        r | a ~ Bernoulli(p_a)
-        p_a ~ Beta(alpha0[a], beta0[a])   
-    independently for each action a in {0, ..., K-1}.
-    """
-    def __init__(self, alpha0: torch.Tensor, beta0: torch.Tensor):
-        """
-        alpha0:     [K] prior pseudo-counts of successes (r=1) per action
-        beta0:      [K] prior pseudo-counts of failures  (r=0) per action
-        """
-        assert isinstance(alpha0, torch.Tensor) and isinstance(beta0, torch.Tensor), "alpha0 and beta0 must be torch tensors"
-        assert alpha0.dim() == 1 and beta0.dim() == 1, "alpha0 and beta0 must be 1D tensors"
-        assert alpha0.shape == beta0.shape, "alpha0 and beta0 must have the same shape"
-        assert torch.all(alpha0 > 0), "alpha0 must be > 0"
-        assert torch.all(beta0 > 0), "beta0 must be > 0"
-
-        self.alpha0 = alpha0.clone().to(torch.float)
-        self.beta0  = beta0.clone().to(torch.float)
-        self.K = int(alpha0.shape[0])
-
-        self.suffstats = SuffStatsBernoulli(self.K)
-        self.reset_posterior()
-
-    def reset_posterior(self):
-        """
-        Posterior parameters start at prior.
-        """
-        self.alpha_n  = self.alpha0.clone()
-        self.beta_n   = self.beta0.clone()
-
-    def update(self, a: int, r: float, confidence: float = 1.0):
-        """
-        Update sufficient stats with (a, r) and refresh posterior parameters.
-        """
-        self.suffstats.update(a, r, confidence=confidence)
-        self._update_posterior()
-
-    def _update_posterior(self):
-        """
-        Beta posterior for each action:
-            alpha_n[a] = alpha0[a] + succ[a]
-            beta_n[a]  = beta0[a]  + fail[a]
-        """
-        succ, fail = self.suffstats.as_tensors()
-        self.alpha_n = self.alpha0 + succ.to(torch.float)
-        self.beta_n  = self.beta0  + fail.to(torch.float)
-
-    def post_params(self):
-        return {
-            "alpha_n":      self.alpha_n, 
-            "beta_n":       self.beta_n
-        }
-
-    def predictive_p(self):
-        """
-        Posterior predictive mean of p_a = P(r=1 | a) for each action.
-        """
-        return self.alpha_n / (self.alpha_n + self.beta_n)
-    
-    def _pred_dist_params(self):
-        """
-        Returns parameters of the Bernoulli predictive distribution for each action.
-        """
-        return self.predictive_p()
-
-    def pred_lh(self, a: int, r: float):
-        """
-        Predictive likelihood of observing reward r given action a.
-            P(r=1 | a) = alpha_n[a] / (alpha_n[a] + beta_n[a])
-            P(r=0 | a) = 1 - P(r=1 | a)
-        """
-        p = self.predictive_p()[a]
-        if r == 1.0:
-            return p
-        elif r == 0.0:
-            return 1.0 - p
-        else:
-            raise ValueError(f"reward r must be 0.0 or 1.0, got {r}")
-
-    def sample_post_dist(self):
-        """
-        Returns a tensor of shape [K] with one sampled p_a per action.
-        """
-        return D.Beta(self.alpha_n, self.beta_n).sample()

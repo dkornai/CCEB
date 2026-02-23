@@ -3,7 +3,7 @@ import numpy as np
 import torch.distributions as D
 from conjugates import ConjugateModel, ConjugateBernoulli, ConjugateGaussian, ConjugateCategorical
 from utils_categorical import normalise, bern_sample, cat_sample, cat2D_sample
-from crp import CRP
+from crp import CRP, CjCRP
 
 
 
@@ -11,68 +11,102 @@ class Particle():
     """
     Main class implementing a single particle in the CCEB model
     """
-    def __init__(self, hyp_gamma, hyp_alpha_o, hyp_alpha_r, hyp_niw=None, hyp_bb=None):
-        
-        # Hyperparameters
-        self.hyp_gamma      = hyp_gamma
-        self.hyp_alpha_o    = hyp_alpha_o
-        self.hyp_alpha_r    = hyp_alpha_r
+    def __init__(self, hyp_cjcrp:dict=None, hyp_niw:dict=None, hyp_bb:dict=None):
+        """
+        Initialise a particle with given hyperparameters and no active contexts.
+
+        :param dict hyp_cjcrp:   hyperparameters for the coupled-jump CRP prior over contexts (gamma, alpha_o, alpha_r)
+        :param dict hyp_niw:     hyperparameters for the Normal-Inverse-Wishart observation model (alpha, beta, kappa, mu)
+        :param dict hyp_bb:      hyperparameters for the Beta-Bernoulli reward model (alpha, beta)
+        """
+        # Store hyperparameters
+        self.hyp_cjcrp      = hyp_cjcrp
         self.hyp_niw        = hyp_niw
         self.hyp_bb         = hyp_bb
+
+        # Coupled jump CRP prior
+        self.hyp_gamma = hyp_cjcrp["gamma"]
+        self.cjcrp = CjCRP(**self.hyp_cjcrp)
 
         # Latent State Space
         self.state_space = [0, 1]
         self.state_probs = torch.tensor([0.5, 0.5])
         self.n_states = len(self.state_space)
 
-        # Context spaces and CRPs
-        self.context_o_space = []
-        self.context_r_space = []
-
-        self.context_o_CRP = CRP(hyp_alpha=self.hyp_alpha_o)
-        self.context_r_CRP = CRP(hyp_alpha=self.hyp_alpha_r)
-
-        self.prev_c_o = 0
-        self.prev_c_r = 0
-
         # Models for observations and rewards, organized by state and context
         self.obs_models : list[list[ConjugateGaussian]] = [[] for _ in self.state_space]
         self.rew_models : list[list[ConjugateBernoulli]] = [[] for _ in self.state_space]
 
+        # Novel context models (used for computing likelihood of new contexts)
         self.novel_obs_model = ConjugateGaussian(**self.hyp_niw)
         self.novel_rew_model = ConjugateBernoulli(**self.hyp_bb)
 
         # Particle weight for resampling
         self.log_weight = 0.0
 
-    
-    @property
-    def n_contexts_o(self):
-        return len(self.context_o_space)
 
-    @property
-    def n_contexts_r(self):
-        return len(self.context_r_space)
-    
-
-
-
-    def create_new_contexts(self, c_o_t, c_r_t):
+    def to_state(self):
         """
-        Create new observation and reward contexts if needed
+        Minimal state representation needed to reconstruct the Particle object. \\
+        This consists of the state for the coupled-jump CRP prior (counts and previously active contexts), \\
+        states of the observation and reward models (sufficent statistics), and the particle weight. 
+        """
+        return {
+            "cjcrp":        self.cjcrp.to_state(),
+
+            "obs_models":   [[m.to_state() for m in self.obs_models[i]] for i in range(self.n_states)],
+            "rew_models":   [[m.to_state() for m in self.rew_models[i]] for i in range(self.n_states)],
+
+            "log_weight":   float(self.log_weight),
+        }
+
+    @classmethod
+    def from_state(cls, hyp_param, state):
+        """
+        Reconstruct the mutable state of a particle from the hyperparameters and the states of the subcomponents.\\
+        Much much faster than deepcopy, and allows the particle to be transferred between processes with minimal overhead
+        """
+        p = cls(hyp_param["hyp_cjcrp"], hyp_param["hyp_niw"], hyp_param["hyp_bb"])        
+
+        # restore cjCRP
+        p.cjcrp = CjCRP.from_state(hyp_param["hyp_cjcrp"], state=state["cjcrp"])
+
+        # Restore Observation Models
+        p.obs_models = [[] for _ in p.state_space]
+        for i in range(p.n_states):
+            for m_state in state["obs_models"][i]:
+                p.obs_models[i].append(ConjugateGaussian.from_state(hyp_param["hyp_niw"], state=m_state))
+
+        # Restore Reward Models
+        p.rew_models = [[] for _ in p.state_space]
+        for i in range(p.n_states):
+            for m_state in state["rew_models"][i]:
+                p.rew_models[i].append(ConjugateBernoulli.from_state(hyp_param["hyp_bb"], state=m_state))
+
+        # Restore weight
+        p.log_weight = float(state["log_weight"])
+
+        return p
+
+    
+
+    def create_new_context_models(self, h_t, c_o_t, c_r_t):
+        """
+        Create likelihood models for the new observation and reward contexts if needed
         """
 
-        # Handle new observation context if needed
-        if c_o_t == self.n_contexts_o: # equality corresponds to new context since contexts are indexed from 0 to n-1
-            self.context_o_space.append(self.n_contexts_o)
-            for i, state in enumerate(self.state_space):
-                self.obs_models[i].append(ConjugateGaussian(**self.hyp_niw))
-        
-        # Handle new reward context if needed
-        if c_r_t == self.n_contexts_r:
-            self.context_r_space.append(self.n_contexts_r)
-            for i, state in enumerate(self.state_space):
-                self.rew_models[i].append(ConjugateBernoulli(**self.hyp_bb))
+        # New models only required if jump occurs
+        if h_t == 1: 
+
+            # Create observation models for new context if needed
+            if c_o_t == self.cjcrp.CRP_o.n_active_contexts: # equality corresponds to new context since contexts are indexed from 0 to n-1
+                for i, state in enumerate(self.state_space):
+                    self.obs_models[i].append(ConjugateGaussian(**self.hyp_niw))
+            
+            # Create reward models for newcontext if needed
+            if c_r_t == self.cjcrp.CRP_r.n_active_contexts:
+                for i, state in enumerate(self.state_space):
+                    self.rew_models[i].append(ConjugateBernoulli(**self.hyp_bb))
 
 
 
@@ -84,10 +118,10 @@ class Particle():
 
         returns a tensor of shape (n_states, n_contexts_o + 1) containing the likelihoods for each state and context (including a new context)
         """
-        likelihoods = torch.zeros(self.n_states, (self.n_contexts_o + 1))
+        likelihoods = torch.zeros(self.n_states, (self.cjcrp.CRP_o.n_active_contexts + 1))
 
         for i in range(self.n_states):
-            for j in range(self.n_contexts_o):
+            for j in range(self.cjcrp.CRP_o.n_active_contexts):
                 """
                 P(o_t | s_t=i, c^o_t=j) = ∫ P(o_t | ω_i,j) P(ω_i,j) dω_i,j
                 """
@@ -107,10 +141,10 @@ class Particle():
 
         returns a tensor of shape (n_states, n_contexts_r + 1) containing the likelihoods for each state and context (including a new context)
         """
-        likelihoods = torch.zeros(self.n_states, (self.n_contexts_r + 1))
+        likelihoods = torch.zeros(self.n_states, (self.cjcrp.CRP_r.n_active_contexts + 1))
 
         for i in range(self.n_states):
-            for k in range(self.n_contexts_r):
+            for k in range(self.cjcrp.CRP_r.n_active_contexts):
                 """
                 P(r_t | s_t=i, c^r_t=k, a_t) = ∫ P(r_t | υ_i,k,a) P(υ_i,k,a) dυ_i,k,a        
                 """
@@ -139,26 +173,26 @@ class Particle():
         """
         P(S_t=i | o_t, H_t=0, ...) ∝ P(o_t | S_t=i, C^o_t=c_o_{t-1}) P(S_t=i)
         """
-        self.state_belief_stay = normalise(torch.einsum('i,i->i', self.state_probs, self._obs_lh[:, self.prev_c_o]))
-        if self.n_contexts_o == 0: # overwrite for the first trial when there are no observation contexts yet
+        self.state_belief_stay = normalise(torch.einsum('i,i->i', self._obs_lh[:, self.cjcrp.prev_c_o], self.state_probs))
+        if self.cjcrp.CRP_o.n_active_contexts == 0: # overwrite for the first trial when there are no observation contexts yet
             self.state_belief_stay = torch.zeros_like(self.state_probs)
         """
         P(S_t=i | o_t, H_t=1, ...) ∝ Σ_j P(o_t | S_t=i, C^o_t=j) P(C^o_t=j | θ^o) P(S_t=i)
         """
-        self.state_belief_jump = normalise(torch.einsum('ij,j,i->i', self._obs_lh, self.context_o_CRP.probs, self.state_probs))
+        self.state_belief_jump = normalise(torch.einsum('ij,j,i->i', self._obs_lh, self.cjcrp.CRP_o.probs, self.state_probs))
 
 
         # Compute marginal likelihoods (evidence) for each branch of the mixture
         """
         P(o_t | H_t=0) = Σ_i P(o_t | S_t=i, C^o_t=c_o_{t-1}) P(S_t=i)
         """
-        stay_evidence = torch.einsum('i,i->', self.state_probs, self._obs_lh[:, self.prev_c_o])
-        if self.n_contexts_o == 0:
+        stay_evidence = torch.einsum('i,i->', self.state_probs, self._obs_lh[:, self.cjcrp.prev_c_o])
+        if self.cjcrp.CRP_o.n_active_contexts == 0:
             stay_evidence = torch.tensor(0.0)
         """
         P(o_t | H_t=1) = Σ_i Σ_j P(o_t | S_t=i, C^o_t=j) P(C^o_t=j | θ^o) P(S_t=i)
         """
-        jump_evidence = torch.einsum("ij,j,i->",  self._obs_lh, self.context_o_CRP.probs, self.state_probs)
+        jump_evidence = torch.einsum("ij,j,i->",  self._obs_lh, self.cjcrp.CRP_o.probs, self.state_probs)
 
         # Total evidence for the observation under the mixture model of jump vs stay
         """
@@ -179,6 +213,9 @@ class Particle():
         """
         Thompson sampling using the temporary belief induced by o_t
         """
+        # ------------------------------------
+        #   Sample provisional latent states
+        # ------------------------------------    
         # Sample provisional jump branch
         """
         h_hat ~ P(H_t | o_t)
@@ -199,15 +236,18 @@ class Particle():
         c_r_hat ~ P(C^r_t | o_t, H_t=h_hat)
         """
         if h_hat == 0:
-            c_r_hat = self.prev_c_r
+            c_r_hat = self.cjcrp.prev_c_r
         else:
-            c_r_hat = self.context_r_CRP.sample()
+            c_r_hat = self.cjcrp.CRP_r.sample()
 
-        # Thompson sample reward parameters for (s_hat, c_r_hat)
+        # -----------------------------------------------
+        #   Thompson sampling under provisional latents
+        # -----------------------------------------------
+        # Sample reward parameters for (s_hat, c_r_hat)
         """
         υ_hat ~ P(ϒ | s_hat, c_r_hat)
         """
-        if c_r_hat == self.n_contexts_r:
+        if c_r_hat == self.cjcrp.CRP_r.n_active_contexts:
             predicted_rewards = self.novel_rew_model.sample_post_dist() # special case for novel context
         else:
             predicted_rewards = self.rew_models[s_hat][c_r_hat].sample_post_dist()
@@ -232,19 +272,21 @@ class Particle():
         """
         self._rew_lh = self.rew_likelihood(a_t, r_t)  # (n_states, n_contexts_r+1)
 
-        # Sample jump, contexts, and state
+        # ------------------------------------
+        #   Sample jump, contexts, and state 
+        # ------------------------------------    
         # 1) Sample Jump
         """
         P(o_t, r_t | H_t=1, a_t) ∝ Σ_i P(r_t | S_t=i, c_r_{t-1}, a_t) P(S_t=i | o_t, H_t=0, ...)
         """
-        stay_evidence = torch.einsum('i,i->', self._rew_lh[:, self.prev_c_r], self.state_belief_stay)
-        if self.n_contexts_r == 0: # overwrite for the first trial when there are no reward contexts yet
+        stay_evidence = torch.einsum('i,i->', self._rew_lh[:, self.cjcrp.prev_c_r], self.state_belief_stay)
+        if self.cjcrp.CRP_r.n_active_contexts == 0: # overwrite for the first trial when there are no reward contexts yet
             stay_evidence = torch.tensor(0.0)
 
         """
         P(H_t=1 | o_t, a_t, r_t) ∝ Σ_k Σ_i P(r_t | S_t=i, C^r_t=k, a_t) P(C^r_t=k | θ^r) P(S_t=i | o_t, H_t=1, ...) 
         """
-        jump_evidence = torch.einsum('ik,k,i->',  self._rew_lh, self.context_r_CRP.probs, self.state_belief_jump)
+        jump_evidence = torch.einsum('ik,k,i->',  self._rew_lh, self.cjcrp.CRP_r.probs, self.state_belief_jump)
 
         # predictive reward evidence 
         """
@@ -266,38 +308,38 @@ class Particle():
             P(C^o_t = j, C^r_t = k | c_o_{t-1}, c_r_{t-1}, H_t=0, ...) 
                 = δ (C^o_t - c_o_{t-1}) δ (C^r_t - c_r_{t-1})
             """
-            c_o_t, c_r_t = self.prev_c_o, self.prev_c_r
+            c_o_t, c_r_t = int(self.cjcrp.prev_c_o), int(self.cjcrp.prev_c_r)
         else:
             """
             P(C^o_t = j, C^r_t = k | c_o_{t-1}, c_r_{t-1}, H_t=1, ...) 
                 ∝ Σ_i P(S_t=i) P(o_t | S_t=i, C^o_t=j) P(r_t | S_t=i, C^r_t=k, a_t) P(C^o_t=j | θ^o) P(C^r_t=k | θ^r)
             """
-            context_probs = torch.einsum('i,ij,ik,j,k->jk', self.state_probs, self._obs_lh, self._rew_lh, self.context_o_CRP.probs, self.context_r_CRP.probs)
+            context_probs = torch.einsum('i,ij,ik,j,k->jk', self.state_probs, self._obs_lh, self._rew_lh, self.cjcrp.CRP_o.probs, self.cjcrp.CRP_r.probs)
             c_o_t, c_r_t = cat2D_sample(context_probs)
         
         # 3) sample state given committed contexts:
         """
-        P(S_t=i | o_t, r_t, a_t, c^o_t, c^r_t) ∝ P(S_t=i) P(o_t | S_t=i, c^o_t) P(r_t | S_t=i, c^r_t, a_t)
+        P(S_t=i | o_t, r_t, a_t, c^o_t, c^r_t) ∝ P(r_t | S_t=i, c^r_t, a_t) P(o_t | S_t=i, c^o_t) P(S_t=i)
         """
-        state_prob = torch.einsum('i,i,i->i', self.state_probs, self._obs_lh[:, c_o_t], self._rew_lh[:, c_r_t])
+        state_prob = torch.einsum('i,i,i->i', self.state_probs, self._rew_lh[:, c_r_t], self._obs_lh[:, c_o_t])
         s_t = cat_sample(state_prob)
 
 
-        # Update parameters     
-        # 1) Update CRPs if needed
-        if h_t == 1:
-            self.context_o_CRP.update_single(c_o_t)
-            self.context_r_CRP.update_single(c_r_t)
-            # create new contexts in the models if needed
-            self.create_new_contexts(c_o_t, c_r_t)
-        # 2) Update observation model
-        self.obs_models[s_t][c_o_t].update(o_t)
-        # 3) Update reward model
-        self.rew_models[s_t][c_r_t].update(a_t, r_t)
 
-        # carry forward contexts
-        self.prev_c_o = c_o_t
-        self.prev_c_r = c_r_t
+        # ---------------------
+        #   Update parameters 
+        # ---------------------    
+        # 1) Create new likelihood models if neeeded
+        self.create_new_context_models(h_t, c_o_t, c_r_t)
+        
+        # 2) Update observation model for the sampled context
+        self.obs_models[s_t][c_o_t].update(o_t)
+        
+        # 3) Update reward model for the sampled context
+        self.rew_models[s_t][c_r_t].update(a_t, r_t)
+        
+        # 4) Update CRP visit counts and previous contexts
+        self.cjcrp.update(h_t, c_o_t, c_r_t)
 
         return s_t, c_o_t, c_r_t, h_t
 
@@ -308,27 +350,39 @@ def print_particle_params(particle: Particle):
     """
     Print the parameters of the particle's models in a readable format
     """
-    print("> Observation Models:")
-    for i, state in enumerate(particle.state_space):
-        for j, context in enumerate(particle.context_o_space):
+
+    # Extract and print the CRP probabilities and sufficient statistics for observation contexts
+    print("> Observation Context CRP:")
+    o_prob = particle.cjcrp.CRP_o.probs.detach().numpy()
+    o_prob = np.array2string(o_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
+    o_ss = particle.cjcrp.CRP_o.counts.detach().numpy()[: particle.cjcrp.CRP_o.n_active_contexts]
+    print("\nObser. Context CRP Probabilities:", o_prob, "Suff Stats:", o_ss)
+    
+
+    print("\n> Observation Models:")
+    for j in range(particle.cjcrp.CRP_o.n_active_contexts):
+        for i, state in enumerate(particle.state_space):
             # Extract and print format the observation model parameters (df, loc)
             observation_model_params = particle.obs_models[i][j]._pred_dist_params()
             df = observation_model_params['df']
             loc = observation_model_params['loc'].detach().numpy()
             loc = np.array2string(loc, formatter={'float_kind':lambda x: f"{x: .2f}"})
             
-            print(f"State {state}, Observ Context {context}, Observation Model Params: df: {df}, loc: {loc}")
+            print(f"State {state}, Observ Context {j}, Observation Model Params: df: {df}, loc: {loc}")
 
-    # Extract and print the CRP probabilities and sufficient statistics for observation contexts
-    o_prob = particle.context_o_CRP.probs.detach().numpy()
-    o_prob = np.array2string(o_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
-    o_ss = particle.context_o_CRP.counts.detach().numpy()
+    
+    print("\n> Reward Context CRP:")
+    # Extract and print the CRP probabilities and sufficient statistics for reward contexts
+    r_prob = particle.cjcrp.CRP_o.probs.detach().numpy()
+    r_prob = np.array2string(r_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
+    r_ss = particle.cjcrp.CRP_o.counts.detach().numpy()[: particle.cjcrp.CRP_r.n_active_contexts]
 
-    print("\nObser. Context CRP Probabilities:", o_prob, "Suff Stats:", o_ss)
+    print("\nReward Context CRP Probabilities:", r_prob, "Suff Stats:", r_ss)
+    
 
     print("\n> Reward Models:")
-    for i, state in enumerate(particle.state_space):
-        for j, context in enumerate(particle.context_r_space):
+    for j in range(particle.cjcrp.CRP_r.n_active_contexts):
+        for i, state in enumerate(particle.state_space):
             # Extract and print format the reward model mean and sufficient statistics
             reward_model_mean = particle.rew_models[i][j]._pred_dist_params().detach().numpy()
             reward_model_mean = np.array2string(reward_model_mean, formatter={'float_kind':lambda x: f"{x: .2f}"})
@@ -337,14 +391,9 @@ def print_particle_params(particle: Particle):
             suff_stats_a = np.round(suff_stats_a, 2)
             suff_stats_b = np.round(suff_stats_b, 2)
 
-            print(f"State {state}, Reward Context {context}, Reward Model Mean: {reward_model_mean}, Suff Stats: {suff_stats_a}, {suff_stats_b}")
+            print(f"State {state}, Reward Context {j}, Reward Model Mean: {reward_model_mean}, Suff Stats: {suff_stats_a}, {suff_stats_b}")
 
-    # Extract and print the CRP probabilities and sufficient statistics for reward contexts
-    r_prob = particle.context_r_CRP.probs.detach().numpy()
-    r_prob = np.array2string(r_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
-    r_ss = particle.context_r_CRP.counts.detach().numpy()
-
-    print("\nReward Context CRP Probabilities:", r_prob, "Suff Stats:", r_ss)
+   
 
 
 
