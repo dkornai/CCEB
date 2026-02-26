@@ -72,7 +72,7 @@ class SPMDWP():
                 out.append(m)
         return out
 
-    def close(self):
+    def deallocate(self):
         """
         Exit out of the worker loops
         """

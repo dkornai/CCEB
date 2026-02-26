@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.distributions as D
 from conjugates import ConjugateModel, ConjugateBernoulli, ConjugateGaussian, ConjugateCategorical
-from utils_categorical import normalise, bern_sample, cat_sample, cat2D_sample
+from utils_sample import normalise, bern_sample, cat_sample, cat2D_sample
 from crp import CRP, CjCRP
 
 
@@ -213,10 +213,6 @@ class Particle():
         """
         Thompson sampling using the temporary belief induced by o_t
         """
-        # ------------------------------------
-        #   Sample provisional latent states
-        # ------------------------------------    
-        # Sample provisional jump branch
         """
         h_hat ~ P(H_t | o_t)
         """
@@ -351,14 +347,16 @@ def print_particle_params(particle: Particle):
     Print the parameters of the particle's models in a readable format
     """
 
+    print("\n> Log weight:", particle.log_weight)
+
     # Extract and print the CRP probabilities and sufficient statistics for observation contexts
-    print("> Observation Context CRP:")
+    print("\n> Observation Context CRP:")
     o_prob = particle.cjcrp.CRP_o.probs.detach().numpy()
     o_prob = np.array2string(o_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
     o_ss = particle.cjcrp.CRP_o.counts.detach().numpy()[: particle.cjcrp.CRP_o.n_active_contexts]
     print("\nObser. Context CRP Probabilities:", o_prob, "Suff Stats:", o_ss)
     
-
+    # Extract and print observation models
     print("\n> Observation Models:")
     for j in range(particle.cjcrp.CRP_o.n_active_contexts):
         for i, state in enumerate(particle.state_space):
@@ -370,16 +368,14 @@ def print_particle_params(particle: Particle):
             
             print(f"State {state}, Observ Context {j}, Observation Model Params: df: {df}, loc: {loc}")
 
-    
+    # Extract and print the CRP probabilities and sufficient statistics for reward contexts    
     print("\n> Reward Context CRP:")
-    # Extract and print the CRP probabilities and sufficient statistics for reward contexts
-    r_prob = particle.cjcrp.CRP_o.probs.detach().numpy()
+    r_prob = particle.cjcrp.CRP_r.probs.detach().numpy()
     r_prob = np.array2string(r_prob, formatter={'float_kind':lambda x: f"{x: .2f}"})
-    r_ss = particle.cjcrp.CRP_o.counts.detach().numpy()[: particle.cjcrp.CRP_r.n_active_contexts]
-
+    r_ss = particle.cjcrp.CRP_r.counts.detach().numpy()[: particle.cjcrp.CRP_r.n_active_contexts]
     print("\nReward Context CRP Probabilities:", r_prob, "Suff Stats:", r_ss)
     
-
+    # Extract and print reward models
     print("\n> Reward Models:")
     for j in range(particle.cjcrp.CRP_r.n_active_contexts):
         for i, state in enumerate(particle.state_space):
